@@ -13,16 +13,18 @@ Team icons from [israelvicars](https://github.com/israelvicars/pkmn-go-emoji).
 `pip install -r requirements.txt`
 
 # Usage
-`python example.py -u myUsername -p myPassword -l "Boulder, CO" -st 5`
+Set pokemon you wish to ignore in `ignore_pokemon.json`.
+
+`python example.py -u myUsername -p myPassword -t google -l "Boulder, CO" -st 5`
 
 -st: steps to take
 
 -l: location, anything that Google Maps understands.
 
+-t: login type `google` or `ptc`
+
 # FAQ
 
 * Do I need Python 2.7? Yes! Can I use Python 3.x? No!
-
-* Can I sign in with Google? Not yet, we're working on it, until then get a Trainer Club account
 
 * I'm on Windows, why does nothing work? See if anything in https://www.reddit.com/r/pokemongodev/comments/4t80df/wip_pokemon_go_map_visualization_google_maps_view/d5feu2f helps

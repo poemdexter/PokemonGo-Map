@@ -3,15 +3,14 @@
 from flask import Flask, render_template
 from flask_googlemaps import GoogleMaps
 from flask_googlemaps import Map
-import os
+import requests
 import re
-import sys
 import struct
 import json
 import time
-import requests
 import argparse
 import threading
+import login
 
 import werkzeug.serving
 
@@ -21,6 +20,7 @@ from google.protobuf.internal import encoder
 from s2sphere import *
 from datetime import datetime
 from geopy.geocoders import GoogleV3
+from gpsoauth import perform_master_login, perform_oauth
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from requests.adapters import ConnectionError
@@ -57,10 +57,6 @@ numbertoteam = {0: "Gym", 1: "Mystic", 2: "Valor", 3: "Instinct"} # At least I'm
 
 # stuff for in-background search thread
 search_thread = None
-
-def parse_unicode(bytestring):
-    decoded_string = bytestring.decode(sys.getfilesystemencoding())
-    return decoded_string
 
 def debug(message):
     if DEBUG:
@@ -145,10 +141,10 @@ def get_location_coords():
     return (COORDS_LATITUDE, COORDS_LONGITUDE, COORDS_ALTITUDE)
 
 
-def retrying_api_req(api_endpoint, access_token, *args, **kwargs):
+def retrying_api_req(api_endpoint, access_token, ltype, *args, **kwargs):
     while True:
         try:
-            response = api_req(api_endpoint, access_token, *args, **kwargs)
+            response = api_req(api_endpoint, access_token, ltype, *args, **kwargs)
             if response:
                 return response
             debug("retrying_api_req: api_req returned None, retrying")
@@ -157,7 +153,7 @@ def retrying_api_req(api_endpoint, access_token, *args, **kwargs):
         time.sleep(1)
 
 
-def api_req(api_endpoint, access_token, *args, **kwargs):
+def api_req(api_endpoint, access_token, ltype, *args, **kwargs):
     p_req = pokemon_pb2.RequestEnvelop()
     p_req.rpc_id = 1469378659230941192
 
@@ -168,7 +164,7 @@ def api_req(api_endpoint, access_token, *args, **kwargs):
     p_req.unknown12 = 989
 
     if 'useauth' not in kwargs or not kwargs['useauth']:
-        p_req.auth.provider = 'ptc'
+        p_req.auth.provider = ltype
         p_req.auth.token.contents = access_token
         p_req.auth.token.unknown13 = 14
     else:
@@ -196,16 +192,16 @@ def api_req(api_endpoint, access_token, *args, **kwargs):
     return p_ret
 
 
-def get_api_endpoint(access_token, api=API_URL):
+def get_api_endpoint(access_token, ltype, api=API_URL):
     profile_response = None
     while not profile_response or not profile_response.api_url:
         debug("get_api_endpoint: calling get_profile")
-        profile_response = get_profile(access_token, api, None)
+        profile_response = get_profile(access_token, api, ltype, None)
 
     return ('https://%s/rpc' % profile_response.api_url)
 
 
-def get_profile(access_token, api, useauth, *reqq):
+def get_profile(access_token, api, ltype, useauth, *reqq):
     req = pokemon_pb2.RequestEnvelop()
     req1 = req.requests.add()
     req1.type = 2
@@ -231,7 +227,7 @@ def get_profile(access_token, api, useauth, *reqq):
     req5.type = 5
     if len(reqq) >= 5:
         req5.MergeFrom(reqq[4])
-    return retrying_api_req(api, access_token, req, useauth=useauth)
+    return retrying_api_req(api, access_token, ltype, req, useauth=useauth)
 
 
 def login_ptc(username, password):
@@ -278,7 +274,7 @@ def login_ptc(username, password):
     return access_token
 
 
-def get_heartbeat(api_endpoint, access_token, response):
+def get_heartbeat(api_endpoint, access_token, ltype, response):
     m4 = pokemon_pb2.RequestEnvelop.Requests()
     m = pokemon_pb2.RequestEnvelop.MessageSingleInt()
     m.f1 = int(time.time() * 1000)
@@ -299,6 +295,7 @@ def get_heartbeat(api_endpoint, access_token, response):
     response = get_profile(
         access_token,
         api_endpoint,
+        ltype,
         response.unknown7,
         m1,
         pokemon_pb2.RequestEnvelop.Requests(),
@@ -312,123 +309,149 @@ def get_heartbeat(api_endpoint, access_token, response):
     heartbeat.ParseFromString(payload)
     return heartbeat
 
+def login_via(usr,pwd,type):
+    access_token=None
+    ltype=None
+    try:
+        if 'goo' in type:
+            print '[!] Using google as login..'
+            google_data= login.login_google(usr,pwd)
+            if google_data is not None:
+                access_token=google_data['id_token']
+                ltype='google'
+            else:
+                access_token=None
+        else:
+            print '[!] I am a poketrainer..'
+            access_token= login.login_pokemon(usr,pwd)
+            ltype='ptc'
+        return access_token,ltype
+    except:
+        print '[-] error in login'
+        return None
+
 def main():
     debug("main")
 
-    full_path = os.path.realpath(__file__)
-    path, filename = os.path.split(full_path)
-    pokemonsJSON = json.load(open(path + '/pokemon.json'))
+    pokemonsJSON = json.load(open('pokemon.json'))
+    ignorePokemonsJSON = json.load(open('ignore_pokemon.json'))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-u", "--username", help="PTC Username", required=True)
     parser.add_argument("-p", "--password", help="PTC Password", required=True)
-    parser.add_argument("-l", "--location", type=parse_unicode, help="Location", required=True)
+    parser.add_argument("-l", "--location", help="Location", required=True)
+    parser.add_argument("-t", "--type", help="Google/PTC", required=True)
     parser.add_argument("-st", "--step_limit", help="Steps", required=True)
     parser.add_argument("-d", "--debug", help="Debug Mode", action='store_true')
     parser.set_defaults(DEBUG=True)
     args = parser.parse_args()
 
-    default_location = args.location
-    if args.debug:
-        global DEBUG
-        DEBUG = True
-        print('[!] DEBUG mode on')
+    if 'ptc' in args.type.lower() or 'goo' in args.type.lower():
+        default_location = args.location
+        if args.debug:
+            global DEBUG
+            DEBUG = True
+            print('[!] DEBUG mode on')
 
-    retrying_set_location(args.location)
 
-    access_token = login_ptc(args.username, args.password)
-    if access_token is None:
-        print('[-] Wrong username/password')
-        return
-    print('[+] RPC Session Token: {} ...'.format(access_token[:25]))
+        retrying_set_location(args.location)
 
-    api_endpoint = get_api_endpoint(access_token)
-    if api_endpoint is None:
-        print('[-] RPC server offline')
-        return
-    print('[+] Received API endpoint: {}'.format(api_endpoint))
+        access_token, ltype = login_via(args.username, args.password, args.type.lower())
+        if access_token is None:
+            print('[-] Wrong username/password')
+            return
+        print('[+] RPC Session Token: {} ...'.format(access_token[:25]))
 
-    profile_response = get_profile(access_token, api_endpoint, None)
-    if profile_response is None or not profile_response.payload:
-        print('[-] Ooops...')
-        raise Exception("Could not get profile")
+        api_endpoint = get_api_endpoint(access_token, ltype)
+        if api_endpoint is None:
+            print('[-] RPC server offline')
+            return
+        print('[+] Received API endpoint: {}'.format(api_endpoint))
 
-    print('[+] Login successful')
+        profile_response = get_profile(access_token, api_endpoint, ltype, None)
+        if profile_response is None or not profile_response.payload:
+            print('[-] Ooops...')
+            raise Exception("Could not get profile")
 
-    payload = profile_response.payload[0]
-    profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
-    profile.ParseFromString(payload)
-    print('[+] Username: {}'.format(profile.profile.username))
+        print('[+] Login successful')
 
-    creation_time = datetime.fromtimestamp(int(profile.profile.creation_time) / 1000)
-    print('[+] You are playing Pokemon Go since: {}'.format(
-        creation_time.strftime('%Y-%m-%d %H:%M:%S'),
-    ))
+        payload = profile_response.payload[0]
+        profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
+        profile.ParseFromString(payload)
+        print('[+] Username: {}'.format(profile.profile.username))
 
-    for curr in profile.profile.currency:
-        print('[+] {}: {}'.format(curr.type, curr.amount))
+        creation_time = datetime.fromtimestamp(int(profile.profile.creation_time) / 1000)
+        print('[+] You are playing Pokemon Go since: {}'.format(
+            creation_time.strftime('%Y-%m-%d %H:%M:%S'),
+        ))
 
-    origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
-    steps = 0
-    steplimit = int(args.step_limit)
-    pos = 1
-    x   = 0
-    y   = 0
-    dx  = 0
-    dy  = -1
-    while steps < steplimit**2:
-        debug("looping: step {} of {}".format(steps, steplimit**2))
-        original_lat = FLOAT_LAT
-        original_long = FLOAT_LONG
-        parent = CellId.from_lat_lng(LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)).parent(15)
-        h = get_heartbeat(api_endpoint, access_token, profile_response)
-        hs = [h]
-        seen = set([])
-        for child in parent.children():
-            latlng = LatLng.from_point(Cell(child).get_center())
-            set_location_coords(latlng.lat().degrees, latlng.lng().degrees, 0)
-            hs.append(get_heartbeat(api_endpoint, access_token, profile_response))
-        set_location_coords(original_lat, original_long, 0)
-        visible = []
-        for hh in hs:
-            try:
-                for cell in hh.cells:
-                    for wild in cell.WildPokemon:
-                        hash = wild.SpawnPointId + ':' + str(wild.pokemon.PokemonId)
-                        if (hash not in seen):
-                            visible.append(wild)
-                            seen.add(hash)
-                    if cell.Fort:
-                        for Fort in cell.Fort:
-                            if Fort.Enabled == True:
-                                if Fort.GymPoints:
-                                    gyms.append([Fort.Team, Fort.Latitude, Fort.Longitude])
-                                elif Fort.FortType:
-                                    pokestops.append([Fort.Latitude, Fort.Longitude])
-            except AttributeError:
-                break
-        for poke in visible:
-            other = LatLng.from_degrees(poke.Latitude, poke.Longitude)
-            diff = other - origin
-            # print(diff)
-            difflat = diff.lat().degrees
-            difflng = diff.lng().degrees
-            time_to_hidden = poke.TimeTillHiddenMs
-            left = '%d hours %d minutes %d seconds' % time_left(time_to_hidden)
-            label = '%s [%s remaining]' % (pokemonsJSON[poke.pokemon.PokemonId - 1]['Name'], left)
-            pokemons.append([poke.pokemon.PokemonId, label, poke.Latitude, poke.Longitude])
-        
-        #Scan location math
-        if (-steplimit/2 < x <= steplimit/2) and (-steplimit/2 < y <= steplimit/2):
-            set_location_coords((x * 0.0025) + deflat, (y * 0.0025 ) + deflng, 0)
-        if x == y or (x < 0 and x == -y) or (x > 0 and x == 1-y):
-            dx, dy = -dy, dx
-        x, y = x+dx, y+dy
-        steps +=1
-        print("Completed:", ((steps + (pos * .25) - .25) / steplimit**2) * 100, "%")
+        for curr in profile.profile.currency:
+            print('[+] {}: {}'.format(curr.type, curr.amount))
 
-        register_background_thread()
+        origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
+        steps = 0
+        steplimit = int(args.step_limit)
+        pos = 1
+        x   = 0
+        y   = 0
+        dx  = 0
+        dy  = -1
+        while steps < steplimit**2:
+            debug("looping: step {} of {}".format(steps, steplimit**2))
+            original_lat = FLOAT_LAT
+            original_long = FLOAT_LONG
+            parent = CellId.from_lat_lng(LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)).parent(15)
+            h = get_heartbeat(api_endpoint, access_token, ltype, profile_response)
+            hs = [h]
+            seen = set([])
+            for child in parent.children():
+                latlng = LatLng.from_point(Cell(child).get_center())
+                set_location_coords(latlng.lat().degrees, latlng.lng().degrees, 0)
+                hs.append(get_heartbeat(api_endpoint, access_token, ltype, profile_response))
+            set_location_coords(original_lat, original_long, 0)
+            visible = []
+            for hh in hs:
+                try:
+                    for cell in hh.cells:
+                        for wild in cell.WildPokemon:
+                            hash = wild.SpawnPointId + ':' + str(wild.pokemon.PokemonId)
+                            if (hash not in seen):
+                                visible.append(wild)
+                                seen.add(hash)
+                        #if cell.Fort:
+                        #    for Fort in cell.Fort:
+                        #        if Fort.Enabled == True:
+                        #            if Fort.GymPoints:
+                        #                gyms.append([Fort.Team, Fort.Latitude, Fort.Longitude])
+                        #            elif Fort.FortType:
+                        #                pokestops.append([Fort.Latitude, Fort.Longitude])
+                except AttributeError:
+                    break
+            for poke in visible:
+                # ignore shitty pokemon
+                if (pokemonsJSON[poke.pokemon.PokemonId - 1]['Name'] not in ignorePokemonsJSON['ignore']):
+                    other = LatLng.from_degrees(poke.Latitude, poke.Longitude)
+                    diff = other - origin
+                    # print(diff)
+                    difflat = diff.lat().degrees
+                    difflng = diff.lng().degrees
+                    time_to_hidden = poke.TimeTillHiddenMs
+                    left = '%d hours %d minutes %d seconds' % time_left(time_to_hidden)
+                    label = '%s [%s remaining]' % (pokemonsJSON[poke.pokemon.PokemonId - 1]['Name'], left)
+                    pokemons.append([poke.pokemon.PokemonId, label, poke.Latitude, poke.Longitude])
+            
+            #Scan location math
+            if (-steplimit/2 < x <= steplimit/2) and (-steplimit/2 < y <= steplimit/2):
+                set_location_coords((x * 0.0025) + deflat, (y * 0.0025 ) + deflng, 0)
+            if x == y or (x < 0 and x == -y) or (x > 0 and x == 1-y):
+                dx, dy = -dy, dx
+            x, y = x+dx, y+dy
+            steps +=1
+            print("Completed:", ((steps + (pos * .25) - .25) / steplimit**2) * 100, "%")
+    else:
+        print '[!] used type "%s" only Google or PTC valid'%(args.type.lower())
 
+    register_background_thread()
 
 def register_background_thread(initial_registration=False):
     """
@@ -463,6 +486,7 @@ def register_background_thread(initial_registration=False):
 
 def create_app():
     app = Flask(__name__, template_folder="templates")
+    app.config['GOOGLEMAPS_KEY'] = GOOGLEMAPS_KEY
 
     GoogleMaps(app, key=GOOGLEMAPS_KEY)
     return app
@@ -511,7 +535,7 @@ def fullmap():
         lat=deflat,
         lng=deflng,
         markers=pokeMarkers,
-        zoom="15"
+        zoom="16"
     )
     return render_template('example_fullmap.html', fullmap=fullmap)
 
